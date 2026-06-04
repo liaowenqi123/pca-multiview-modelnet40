@@ -298,3 +298,161 @@ class MultiViewResNetV3(nn.Module):
         logits = logits_fusion + logits_views_sum
 
         return logits
+
+
+# ══════════════════════════════════════════════════════════════
+#  V4: TinyCNN + 十二面体 6 视图 + 5 通道投影
+# ══════════════════════════════════════════════════════════════
+
+class TinyCNN(nn.Module):
+    """
+    手写轻量 CNN 特征提取器，无预训练，适配 56×56×5 投影图。
+
+    结构 (base_ch=32, 输出 128 维):
+        56×56×5   → Conv(5→32)    + BN + ReLU → MaxPool(2) → 28×28×32
+        28×28×32  → Conv(32→64)   + BN + ReLU → MaxPool(2) → 14×14×64
+        14×14×64  → Conv(64→128)  + BN + ReLU → MaxPool(2) → 7×7×128
+        7×7×128   → Conv(128→128) + BN + ReLU → AdaptiveAvgPool(1) → 128
+
+    总参数 < 100K（base_ch=32 时 ~98K）。
+    """
+
+    def __init__(self, in_channels: int = 5, base_ch: int = 32):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            # Stage 1: 56² → 28²
+            nn.Conv2d(in_channels, base_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_ch),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            # Stage 2: 28² → 14²
+            nn.Conv2d(base_ch, base_ch * 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_ch * 2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            # Stage 3: 14² → 7²
+            nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_ch * 4),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            # Stage 4: 7² → (7², 无降分辨率)
+            nn.Conv2d(base_ch * 4, base_ch * 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_ch * 4),
+            nn.ReLU(inplace=True),
+        )
+        self.out_channels = base_ch * 4
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.pool(x)
+        return x.view(x.size(0), -1)
+
+
+class MultiViewResNetV4(nn.Module):
+    """
+    V4: TinyCNN + 十二面体 6 视图 + 双重路径（同 V3 门控架构）。
+
+    数据流:
+        点云 → PCA → 十二面体 6 向投影 (6×5×56×56)
+          ↓
+        共享 TinyCNN → 每视图 128d 特征
+          ↓
+        Path A: 各自投影(128→dim_reduce) → concat → 融合分类
+        Path B: 共享置信度投影(128→1)×sigmoid × 独立分类头(128→40) → 求和
+          ↓
+        final = Path A + Path B
+
+    参数:
+        in_channels:  投影图通道数 (default 5)
+        base_ch:      TinyCNN 基础通道数 (default 32)
+        dim_reduce:   融合前各视角降维目标 (default 32)
+        confidence_bias: 置信度投影 bias 初始化
+        dropout:      分类头 Dropout
+        num_classes:  类别数
+    """
+
+    def __init__(self,
+                 in_channels: int = 5,
+                 base_ch: int = 32,
+                 dim_reduce: int = 32,
+                 confidence_bias: float = -1.0,
+                 dropout: float = 0.5,
+                 num_classes: int = NUM_CLASSES):
+        super().__init__()
+
+        # ── 骨干 ──
+        self.backbone = TinyCNN(in_channels=in_channels, base_ch=base_ch)
+        C_out = self.backbone.out_channels  # base_ch * 4
+        self.num_views = 6                  # 十二面体 6 个单方向
+        self.avgpool = nn.Identity()  # TinyCNN 已经自带 pool
+
+        # ── Path A: 各自投影降维 ──
+        reduction = dim_reduce
+        self.view_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(C_out, reduction),
+                nn.BatchNorm1d(reduction),
+                nn.ReLU(inplace=True),
+            )
+            for _ in range(self.num_views)
+        ])
+
+        # 融合分类头
+        fusion_in = self.num_views * reduction
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_in, reduction * 2),
+            nn.BatchNorm1d(reduction * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(reduction * 2, num_classes),
+        )
+
+        # ── Path B: 置信度门控独立分类 ──
+        self.confidence_proj = nn.Linear(C_out, 1)
+        nn.init.constant_(self.confidence_proj.bias, confidence_bias)
+
+        self.view_classifiers = nn.ModuleList([
+            nn.Linear(C_out, num_classes)
+            for _ in range(self.num_views)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, 6, 5, 56, 56)  — 十二面体 6 视角 × 5 通道
+        Returns:
+            logits: (B, num_classes)
+        """
+        B, V, C, H, W = x.shape
+
+        # ── 共享骨干 ──
+        x_flat = x.view(B * V, C, H, W)
+        features = self.backbone(x_flat)      # (B*6, C_out)
+        features = features.view(B, V, -1)    # (B, 6, C_out)
+
+        # ════════════════════════════════════════════
+        #  Path A: 投影降维 → concat → 融合分类
+        # ════════════════════════════════════════════
+        projected = [self.view_projections[i](features[:, i, :])
+                     for i in range(V)]
+        fused = torch.cat(projected, dim=1)
+        logits_fusion = self.classifier(fused)
+
+        # ════════════════════════════════════════════
+        #  Path B: 置信度门控 × 独立视角
+        # ════════════════════════════════════════════
+        logits_views = []
+        for i in range(V):
+            feat_i = features[:, i, :]
+            confidence = torch.sigmoid(self.confidence_proj(feat_i))
+            view_logits = self.view_classifiers[i](feat_i)
+            logits_views.append(confidence * view_logits)
+
+        logits_views_sum = torch.stack(logits_views, dim=1).sum(dim=1)
+
+        return logits_fusion + logits_views_sum

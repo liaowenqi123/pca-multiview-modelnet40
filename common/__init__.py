@@ -56,5 +56,5 @@ from .preprocessing import NUM_CLASSES, NUM_POINTS, GRID_SIZE
 # ─── 便捷导出 ───────────────────────────────────────────────
 from .preprocessing import pca_align, multi_view_project, augment_points
 from .dataset import ModelNet40MultiView
-from .models import MultiViewResNet, MultiViewResNetV3
+from .models import MultiViewResNet, MultiViewResNetV3, MultiViewResNetV4
 from .train_utils import train_one_epoch, evaluate

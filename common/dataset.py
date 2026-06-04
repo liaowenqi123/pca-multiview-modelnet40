@@ -20,19 +20,21 @@ class ModelNet40MultiView(Dataset):
 
     def __init__(self, points: np.ndarray, labels: np.ndarray,
                  num_views: int = 3,
-                 projection: str = "ortho",     # "ortho" | "dodeca"
+                 projection: str = "ortho",
                  grid_size: int = GRID_SIZE,
                  augment: bool = False,
-                 cache_pca: bool = True):
+                 cache_pca: bool = True,
+                 return_aligned: bool = False):
         """
         Args:
-            points:    (N, 2048, 3) 点云
-            labels:    (N,) 标签
-            num_views: 视图数 (ortho: 3/6, dodeca: 固定 6)
-            projection: "ortho"=正交三/六视图, "dodeca"=十二面体 6 向 5 通道
-            grid_size: 投影图像分辨率
-            augment:   是否做数据增强
-            cache_pca: 是否缓存 PCA 对齐结果
+            points:         (N, 2048, 3) 点云
+            labels:         (N,) 标签
+            num_views:      视图数 (ortho: 3/6, dodeca: 固定 6)
+            projection:     "ortho"|"dodeca"
+            grid_size:      投影分辨率
+            augment:        数据增强
+            cache_pca:      缓存 PCA 对齐
+            return_aligned: V6 用 — 额外返回对齐后的原始点云 (2048, 3)
         """
         self.points = points
         self.labels = labels
@@ -41,8 +43,8 @@ class ModelNet40MultiView(Dataset):
         self.grid_size = grid_size
         self.augment = augment
         self.cache_pca = cache_pca
+        self.return_aligned = return_aligned
 
-        # dodeca 模式下固定使用 5 通道归一化
         self._dodeca = (projection == "dodeca")
         if self._dodeca:
             self.norm_mean = NORM_5CH_MEAN
@@ -86,4 +88,9 @@ class ModelNet40MultiView(Dataset):
         views = (views - self.norm_mean) / self.norm_std
 
         label = self.labels[idx]
+
+        if self.return_aligned:
+            return (torch.from_numpy(views),
+                    torch.from_numpy(pts),
+                    torch.tensor(label, dtype=torch.long))
         return torch.from_numpy(views), torch.tensor(label, dtype=torch.long)

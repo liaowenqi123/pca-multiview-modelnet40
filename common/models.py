@@ -4,6 +4,7 @@ MultiViewResNet：多视角 ResNet 特征提取 + 对称融合 + 分类。
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .preprocessing import NUM_CLASSES, GRID_SIZE
 
@@ -456,3 +457,304 @@ class MultiViewResNetV4(nn.Module):
         logits_views_sum = torch.stack(logits_views, dim=1).sum(dim=1)
 
         return logits_fusion + logits_views_sum
+
+
+# ══════════════════════════════════════════════════════════════
+#  V6: V3 + PointNet 交叉注意力路径
+# ══════════════════════════════════════════════════════════════
+
+class PointAttentionPath(nn.Module):
+    """
+    点云自注意力 + PointNet → 与 V3 视角特征做交叉注意力。
+
+    流程:
+        原始点云 (B, 2048, 3)
+          │
+          ▼ 自注意力 (无 embedding，直接在坐标上做)
+        (B, 2048, d_attn)
+          │
+          ▼ PointNet (per-point MLP)
+        (B, 2048, d_pointnet)
+          │
+          ├─→ K: Linear(d_pointnet → d_kv)  → (B, 2048, d_kv)
+          └─→ V: Linear(d_pointnet → d_kv)  → (B, 2048, d_kv)
+                                               │
+        V3 的 3 个融合视角特征 (B, 3, C_out_3v)  │
+          │                                     │
+          ▼ Q: Linear(C_out_3v → d_kv) → (B, 3, d_kv)
+                                               │
+          └────────── 交叉注意力 ────────────────┘
+                      Q · K^T / √d_kv → softmax
+                      weighted sum of V
+                    (B, 3, d_kv) → mean pool → (B, d_kv)
+                      │
+                      ▼ Linear(d_kv → num_classes)
+                    logits_pointnet (B, 40)
+
+    参数量 < 100K，对 12M 的 V3 backbone 几乎免费。
+    """
+
+    def __init__(self,
+                 point_dim: int = 3,
+                 d_attn: int = 64,
+                 d_pointnet: int = 128,
+                 d_kv: int = 64,
+                 c_out_v3: int = 512,
+                 num_heads: int = 4,
+                 num_classes: int = NUM_CLASSES):
+        super().__init__()
+
+        self.d_attn = d_attn
+        self.d_kv = d_kv
+        self.num_heads = num_heads
+        self.d_head = d_attn // num_heads
+
+        # ── 自注意力 QKV 投影 (直接在坐标上) ──
+        self.sa_q = nn.Linear(point_dim, d_attn)
+        self.sa_k = nn.Linear(point_dim, d_attn)
+        self.sa_v = nn.Linear(point_dim, d_attn)
+        self.sa_norm = nn.LayerNorm(d_attn)
+
+        # ── PointNet (per-point MLP, 用 Conv1d) ──
+        self.point_mlp = nn.Sequential(
+            nn.Conv1d(d_attn, 64, 1),
+            nn.BatchNorm1d(64), nn.ReLU(inplace=True),
+            nn.Conv1d(64, 128, 1),
+            nn.BatchNorm1d(128), nn.ReLU(inplace=True),
+            nn.Conv1d(128, d_pointnet, 1),
+            nn.BatchNorm1d(d_pointnet), nn.ReLU(inplace=True),
+        )
+
+        # ── K, V 生成 ──
+        self.kv_proj = nn.Conv1d(d_pointnet, d_kv * 2, 1)
+
+        # ── Q 投影 (从 V3 视角特征) ──
+        self.q_proj = nn.Linear(c_out_v3, d_kv)
+
+        # ── 输出投影 ──
+        self.out_proj = nn.Sequential(
+            nn.Linear(d_kv, d_kv * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_kv * 2, num_classes),
+        )
+
+    def forward(self, points: torch.Tensor,
+                v3_view_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            points:           (B, N, 3)         原始/PCA 对齐后的点云
+            v3_view_features: (B, 3, C_out_v3)  V3 backbone 的 3 个融合后视角特征
+
+        Returns:
+            logits: (B, num_classes)
+        """
+        B, N, _ = points.shape
+
+        # ════════════════════════════════════════════
+        #  1. 自注意力 (无 learnable embedding)
+        # ════════════════════════════════════════════
+        q = self.sa_q(points)  # (B, N, d_attn)
+        k = self.sa_k(points)
+        v = self.sa_v(points)
+
+        # 多头部 reshape
+        q = q.view(B, N, self.num_heads, self.d_head).transpose(1, 2)  # (B, H, N, dh)
+        k = k.view(B, N, self.num_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.d_head).transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) / (self.d_head ** 0.5)
+        attn = F.softmax(attn, dim=-1)
+        sa_out = (attn @ v).transpose(1, 2).contiguous().view(B, N, -1)  # (B, N, d_attn)
+
+        # 残差 + LayerNorm
+        sa_out = self.sa_norm(sa_out + self.sa_v(points))  # (B, N, d_attn)
+
+        # ════════════════════════════════════════════
+        #  2. PointNet
+        # ════════════════════════════════════════════
+        pn_in = sa_out.transpose(1, 2)          # (B, d_attn, N)
+        pn_out = self.point_mlp(pn_in)           # (B, d_pointnet, N)
+
+        # ════════════════════════════════════════════
+        #  3. 生成 K, V (per-point)
+        # ════════════════════════════════════════════
+        kv = self.kv_proj(pn_out)                # (B, d_kv*2, N)
+        k_pn = kv[:, :self.d_kv, :]              # (B, d_kv, N)
+        v_pn = kv[:, self.d_kv:, :]              # (B, d_kv, N)
+
+        # ════════════════════════════════════════════
+        #  4. Q 来自 V3 的 3 个视角特征
+        # ════════════════════════════════════════════
+        q_v3 = self.q_proj(v3_view_features)      # (B, 3, d_kv)
+
+        # ════════════════════════════════════════════
+        #  5. 交叉注意力: Q_v3(B,3,d) × K_pn(B,N,d)^T
+        # ════════════════════════════════════════════
+        # scores: (B, 3, N)
+        scores = torch.bmm(q_v3, k_pn.transpose(1, 2)) / (self.d_kv ** 0.5)
+        attn_weights = F.softmax(scores, dim=-1)
+
+        # weighted V: (B, 3, N) × (B, N, d_kv) → (B, 3, d_kv)
+        weighted_v = torch.bmm(attn_weights, v_pn.transpose(1, 2))
+
+        # 视角池化 → (B, d_kv)
+        pooled = weighted_v.mean(dim=1)
+
+        # ════════════════════════════════════════════
+        #  6. 输出投影
+        # ════════════════════════════════════════════
+        logits = self.out_proj(pooled)             # (B, num_classes)
+        return logits
+
+
+class MultiViewResNetV6(nn.Module):
+    """
+    V6: V3 架构 + PointNet 交叉注意力路径。
+
+    数据流全景:
+        ┌─── 投影视图 ───→ V3 backbone (ResNet18) ───→ 对称融合
+        │                                                     │
+        │                           V3 路径 (同 v3)            ├─→ 3 个融合视角特征 (B, 3, 512)
+        │                         投影 + 门控 + 分类            │         │
+        │                              │                       │         ▼ Q
+        │                              ▼                       │   交叉注意力 ← K, V ← PointNet
+        │                        logits_v3 (B, 40)              │         │
+        │                              │                       │         ▼
+        │                              │                  logits_pn (B, 40)
+        │                              │                       │
+        └──────────────────────────────┼───────────────────────┘
+                                       ▼
+                               final = v3 + pn
+
+    输入格式:
+        model((views, points))
+        - views:  (B, 6, 3, 224, 224)  六视图投影图
+        - points: (B, 2048, 3)          PCA 对齐后的原始点云
+    """
+
+    def __init__(self,
+                 backbone: str = "resnet18",
+                 num_views: int = 6,
+                 symmetric_fusion: bool = True,
+                 dim_reduce: int = 256,
+                 d_attn: int = 64,
+                 d_pointnet: int = 128,
+                 d_kv: int = 64,
+                 confidence_bias: float = -1.0,
+                 pretrained: bool = True,
+                 dropout: float = 0.5,
+                 num_classes: int = NUM_CLASSES):
+        super().__init__()
+
+        # ════════════════════════════════════════════
+        #  V3 路径 (完整复用)
+        # ════════════════════════════════════════════
+        C_out, _ = _BACKBONES[backbone]
+        self.backbone = _make_backbone(backbone, pretrained=pretrained)
+        self.backbone_out_channels = C_out
+        self.num_views = num_views
+        self.symmetric_fusion = symmetric_fusion
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.num_fused = 3 if symmetric_fusion else num_views
+
+        reduction = dim_reduce
+        self.view_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(C_out, reduction),
+                nn.BatchNorm1d(reduction),
+                nn.ReLU(inplace=True),
+            )
+            for _ in range(self.num_fused)
+        ])
+
+        fusion_in = self.num_fused * reduction
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_in, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes),
+        )
+
+        self.confidence_proj = nn.Linear(C_out, 1)
+        nn.init.constant_(self.confidence_proj.bias, confidence_bias)
+
+        self.view_classifiers = nn.ModuleList([
+            nn.Linear(C_out, num_classes)
+            for _ in range(self.num_fused)
+        ])
+
+        # ════════════════════════════════════════════
+        #  PointNet 交叉注意力路径
+        # ════════════════════════════════════════════
+        self.point_path = PointAttentionPath(
+            point_dim=3,
+            d_attn=d_attn,
+            d_pointnet=d_pointnet,
+            d_kv=d_kv,
+            c_out_v3=C_out,           # V3 视角特征的维度
+            num_classes=num_classes,
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: tuple of (views, points)
+               views:  (B, V, C_img, H, W)  投影图
+               points: (B, N, 3)            PCA 对齐点云
+
+        Returns:
+            logits: (B, num_classes)
+        """
+        views, points = x
+        B, V, C_img, H, W = views.shape
+
+        # ════════════════════════════════════════════
+        #  V3 backbone: 视图特征提取
+        # ════════════════════════════════════════════
+        x_flat = views.view(B * V, C_img, H, W)
+        features = self.backbone(x_flat)          # (B*V, C_out, 7, 7)
+        features = self.avgpool(features)          # (B*V, C_out, 1, 1)
+        features = features.view(B * V, -1)        # (B*V, C_out)
+        features = features.view(B, V, -1)         # (B, V, C_out)
+
+        # 对称融合
+        if self.symmetric_fusion:
+            f1 = features[:, 0::2, :]
+            f2 = features[:, 1::2, :]
+            features = torch.maximum(f1, f2)       # (B, 3, C_out)
+
+        # ★ 保存融合后视角特征，传给 PointNet 路径做 Q
+        v3_view_features = features                 # (B, 3, C_out)
+
+        # ════════════════════════════════════════════
+        #  V3 Path A: 投影降维 → concat → 融合分类
+        # ════════════════════════════════════════════
+        projected = [self.view_projections[i](features[:, i, :])
+                     for i in range(self.num_fused)]
+        fused = torch.cat(projected, dim=1)
+        logits_fusion = self.classifier(fused)
+
+        # ════════════════════════════════════════════
+        #  V3 Path B: 置信度门控
+        # ════════════════════════════════════════════
+        logits_views = []
+        for i in range(self.num_fused):
+            feat_i = features[:, i, :]
+            confidence = torch.sigmoid(self.confidence_proj(feat_i))
+            view_logits = self.view_classifiers[i](feat_i)
+            logits_views.append(confidence * view_logits)
+        logits_views_sum = torch.stack(logits_views, dim=1).sum(dim=1)
+
+        logits_v3 = logits_fusion + logits_views_sum   # (B, 40)
+
+        # ════════════════════════════════════════════
+        #  PointNet 交叉注意力路径
+        # ════════════════════════════════════════════
+        logits_pn = self.point_path(points, v3_view_features)  # (B, 40)
+
+        return logits_v3 + logits_pn

@@ -5,6 +5,21 @@
 import torch
 
 
+def _unpack_batch(batch, device):
+    """兼容 2-tuple (views, labels) 和 3-tuple (views, points, labels)。"""
+    if len(batch) == 3:
+        views, points, labels = batch
+        views = views.to(device, non_blocking=True)
+        points = points.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        return (views, points), labels
+    else:
+        views, labels = batch
+        views = views.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        return views, labels
+
+
 def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch):
     """训练一个 epoch，返回 (avg_loss, accuracy)。"""
     model.train()
@@ -18,12 +33,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch):
     except ImportError:
         pbar = dataloader
 
-    for batch_idx, (views, labels) in enumerate(pbar):
-        views = views.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    for batch in pbar:
+        model_input, labels = _unpack_batch(batch, device)
 
         optimizer.zero_grad()
-        logits = model(views)
+        logits = model(model_input)
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
@@ -48,11 +62,10 @@ def evaluate(model, dataloader, criterion, device):
     correct = 0
     total = 0
 
-    for views, labels in dataloader:
-        views = views.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    for batch in dataloader:
+        model_input, labels = _unpack_batch(batch, device)
 
-        logits = model(views)
+        logits = model(model_input)
         loss = criterion(logits, labels)
 
         total_loss += loss.item()

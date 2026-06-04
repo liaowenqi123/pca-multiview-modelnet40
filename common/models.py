@@ -591,7 +591,7 @@ class PointAttentionPath(nn.Module):
         #  5. 交叉注意力: Q_v3(B,3,d) × K_pn(B,N,d)^T
         # ════════════════════════════════════════════
         # scores: (B, 3, N)
-        scores = torch.bmm(q_v3, k_pn.transpose(1, 2)) / (self.d_kv ** 0.5)
+        scores = torch.bmm(q_v3, k_pn) / (self.d_kv ** 0.5)
         attn_weights = F.softmax(scores, dim=-1)
 
         # weighted V: (B, 3, N) × (B, N, d_kv) → (B, 3, d_kv)

@@ -7,10 +7,10 @@ test_points.npy
 # Checkpoints
 checkpoints/
 
-# Inference & submission
-inference.py
-result.json
-result.zip
+# Inference & submission (root level only)
+/inference.py
+/result.json
+/result.zip
 
 # Python
 __pycache__/

@@ -1,0 +1,34 @@
+# Data (too large for GitHub)
+train_points.npy
+train_labels.npy
+test_points.npy
+*.npy
+
+# Checkpoints
+checkpoints/
+
+# Inference & submission
+inference.py
+result.json
+result.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.cache/
+
+# Auto-generated metadata
+.codewhale/
+package-lock.json

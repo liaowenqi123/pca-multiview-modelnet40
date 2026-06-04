@@ -995,19 +995,26 @@ class MultiViewResNetV7(nn.Module):
         self.num_fused = 3 if symmetric_fusion else num_views
 
         # ★ 冻结 backbone 前几层
-        _freeze_order = ["conv1", "bn1", "layer1", "layer2", "layer3", "layer4"]
-        freeze_set = set()
-        for name in _freeze_order:
-            freeze_set.add(name)
+        # nn.Sequential 的参数名是索引，不是原始层名:
+        #   0=conv1, 1=bn1, 2=relu, 3=maxpool,
+        #   4=layer1, 5=layer2, 6=layer3, 7=layer4
+        _freeze_idx = {"conv1": 0, "bn1": 1, "layer1": 4,
+                       "layer2": 5, "layer3": 6, "layer4": 7}
+        _order = ["conv1", "bn1", "layer1", "layer2", "layer3", "layer4"]
+        freeze_ids = set()
+        for name in _order:
+            freeze_ids.add(_freeze_idx[name])
             if name == freeze_until:
                 break
         frozen_count = 0
         for name, param in self.backbone.named_parameters():
-            for prefix in freeze_set:
-                if name.startswith(prefix):
+            prefix = name.split(".")[0]
+            try:
+                if int(prefix) in freeze_ids:
                     param.requires_grad = False
                     frozen_count += 1
-                    break
+            except ValueError:
+                pass
         print(f"[V7] 冻结 {frozen_count} 个 backbone 参数 (≤ {freeze_until})")
 
         reduction = dim_reduce

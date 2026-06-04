@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--d_attn", type=int, default=128, help="点云自注意力维度")
     parser.add_argument("--d_pointnet", type=int, default=512, help="PointNet 特征维")
     parser.add_argument("--d_kv", type=int, default=128, help="交叉注意力 K/V 维")
+    parser.add_argument("--n_sample", type=int, default=512, help="自注意力下采样点数")
     parser.add_argument("--no_pretrain", action="store_true")
     parser.add_argument("--no_cache_pca", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
@@ -109,6 +110,7 @@ def main():
         backbone="resnet18", num_views=6, symmetric_fusion=True,
         dim_reduce=args.dim_reduce,
         d_attn=args.d_attn, d_pointnet=args.d_pointnet, d_kv=args.d_kv,
+        n_sample=args.n_sample,
         pretrained=not args.no_pretrain, dropout=args.dropout,
     ).to(device)
 
@@ -116,7 +118,7 @@ def main():
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[模型] 参数: {total:,} (可训练 {trainable:,})")
     print(f"[模型] V3 融合输入: {model.num_fused * args.dim_reduce}d")
-    print(f"[模型] PointNet attn dims: d_attn={args.d_attn} d_pn={args.d_pointnet} d_kv={args.d_kv}")
+    print(f"[模型] PointNet attn dims: d_attn={args.d_attn} d_pn={args.d_pointnet} d_kv={args.d_kv} n_sample={args.n_sample}")
 
     # ── 优化器 ──
     optimizer = optim.AdamW([

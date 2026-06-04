@@ -499,6 +499,7 @@ class PointAttentionPath(nn.Module):
                  d_attn: int = 128,
                  d_pointnet: int = 512,
                  d_kv: int = 128,
+                 n_sample: int = 512,
                  c_out_v3: int = 512,
                  num_heads: int = 8,
                  num_classes: int = NUM_CLASSES):
@@ -506,6 +507,7 @@ class PointAttentionPath(nn.Module):
 
         self.d_attn = d_attn
         self.d_kv = d_kv
+        self.n_sample = n_sample
         self.num_heads = num_heads
         self.d_head = d_attn // num_heads
 
@@ -558,23 +560,33 @@ class PointAttentionPath(nn.Module):
         B, N, _ = points.shape
 
         # ════════════════════════════════════════════
+        #  0. 随机下采样 → 降低 O(N²) 自注意力显存
+        # ════════════════════════════════════════════
+        n = min(N, self.n_sample)
+        if self.training or n < N:
+            idx = torch.randperm(N, device=points.device)[:n]
+            idx = idx.unsqueeze(0).expand(B, -1)  # (B, n)
+            points = torch.gather(points, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
+        N_sa = points.shape[1]
+
+        # ════════════════════════════════════════════
         #  1. 自注意力 (无 learnable embedding)
         # ════════════════════════════════════════════
-        q = self.sa_q(points)  # (B, N, d_attn)
+        q = self.sa_q(points)  # (B, N_sa, d_attn)
         k = self.sa_k(points)
         v = self.sa_v(points)
 
         # 多头部 reshape
-        q = q.view(B, N, self.num_heads, self.d_head).transpose(1, 2)  # (B, H, N, dh)
-        k = k.view(B, N, self.num_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, N, self.num_heads, self.d_head).transpose(1, 2)
+        q = q.view(B, N_sa, self.num_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, N_sa, self.num_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, N_sa, self.num_heads, self.d_head).transpose(1, 2)
 
         attn = (q @ k.transpose(-2, -1)) / (self.d_head ** 0.5)
         attn = F.softmax(attn, dim=-1)
-        sa_out = (attn @ v).transpose(1, 2).contiguous().view(B, N, -1)  # (B, N, d_attn)
+        sa_out = (attn @ v).transpose(1, 2).contiguous().view(B, N_sa, -1)
 
         # 残差 + LayerNorm
-        sa_out = self.sa_norm(sa_out + self.sa_v(points))  # (B, N, d_attn)
+        sa_out = self.sa_norm(sa_out + self.sa_v(points))  # (B, N_sa, d_attn)
 
         # ════════════════════════════════════════════
         #  2. PointNet
@@ -647,6 +659,7 @@ class MultiViewResNetV6(nn.Module):
                  d_attn: int = 128,
                  d_pointnet: int = 512,
                  d_kv: int = 128,
+                 n_sample: int = 512,
                  confidence_bias: float = -1.0,
                  pretrained: bool = True,
                  dropout: float = 0.5,
@@ -703,7 +716,8 @@ class MultiViewResNetV6(nn.Module):
             d_attn=d_attn,
             d_pointnet=d_pointnet,
             d_kv=d_kv,
-            c_out_v3=C_out,           # V3 视角特征的维度
+            n_sample=n_sample,
+            c_out_v3=C_out,
             num_classes=num_classes,
         )
 

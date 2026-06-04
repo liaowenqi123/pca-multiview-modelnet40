@@ -779,3 +779,312 @@ class MultiViewResNetV6(nn.Module):
         logits_pn = self.point_path(points, v3_view_features)  # (B, 40)
 
         return logits_v3 + logits_pn
+
+
+# ══════════════════════════════════════════════════════════════
+#  V7: 冻结 backbone + PointNet(压缩→SA→扩展→交叉注意力) + 可学习融合门
+# ══════════════════════════════════════════════════════════════
+
+class PointNetPathV7(nn.Module):
+    """
+    先 PointNet 压缩 → 自注意力 → PointNet 扩展 → 交叉注意力。
+
+    与 V6 的关键区别：
+      - 自注意力在 PointNet 压缩后的低维 latent 上进行（更有语义）
+      - 不再对原始坐标做自注意力
+
+    流程:
+        points (B, n, 3)
+          ↓ compress: 3 → 32 → d_latent
+        (B, n, d_latent)
+          ↓ 自注意力 (single-head, d_latent 维)
+        (B, n, d_latent)
+          ↓ expand: d_latent → 128 → 256 → d_pointnet
+        (B, n, d_pointnet)
+          ↓ K, V 投影
+          ↓ Q ← V3 视角特征
+          ↓ 交叉注意力 → 输出
+    """
+
+    def __init__(self,
+                 in_dim: int = 3,
+                 d_latent: int = 64,
+                 d_pointnet: int = 512,
+                 d_kv: int = 128,
+                 n_sample: int = 512,
+                 c_out_v3: int = 512,
+                 num_classes: int = NUM_CLASSES):
+        super().__init__()
+
+        self.d_latent = d_latent
+        self.d_kv = d_kv
+        self.n_sample = n_sample
+
+        # ── Compress: 3 → 32 → d_latent ──
+        self.compress = nn.Sequential(
+            nn.Conv1d(in_dim, 32, 1),
+            nn.BatchNorm1d(32), nn.ReLU(inplace=True),
+            nn.Conv1d(32, d_latent, 1),
+            nn.BatchNorm1d(d_latent), nn.ReLU(inplace=True),
+        )
+
+        # ── 自注意力 (在 latent 空间) ──
+        self.sa_q = nn.Linear(d_latent, d_latent)
+        self.sa_k = nn.Linear(d_latent, d_latent)
+        self.sa_v = nn.Linear(d_latent, d_latent)
+        self.sa_norm = nn.LayerNorm(d_latent)
+
+        # ── Expand: d_latent → 128 → 256 → d_pointnet ──
+        self.expand = nn.Sequential(
+            nn.Conv1d(d_latent, 128, 1),
+            nn.BatchNorm1d(128), nn.ReLU(inplace=True),
+            nn.Conv1d(128, 256, 1),
+            nn.BatchNorm1d(256), nn.ReLU(inplace=True),
+            nn.Conv1d(256, d_pointnet, 1),
+            nn.BatchNorm1d(d_pointnet), nn.ReLU(inplace=True),
+        )
+
+        # ── K, V ──
+        self.kv_proj = nn.Conv1d(d_pointnet, d_kv * 2, 1)
+
+        # ── Q 投影 (从 V3) ──
+        self.q_proj = nn.Linear(c_out_v3, d_kv)
+
+        # ── 输出 ──
+        self.out_proj = nn.Sequential(
+            nn.Linear(d_kv, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, points: torch.Tensor,
+                v3_view_features: torch.Tensor) -> torch.Tensor:
+        B, N, _ = points.shape
+
+        # ── 随机下采样 ──
+        n = min(N, self.n_sample)
+        if self.training or n < N:
+            idx = torch.randperm(N, device=points.device)[:n]
+            idx = idx.unsqueeze(0).expand(B, -1)
+            points = torch.gather(points, 1,
+                                  idx.unsqueeze(-1).expand(-1, -1, 3))
+
+        # ── Compress ──
+        x = points.transpose(1, 2)          # (B, 3, M)
+        x = self.compress(x)                 # (B, d_latent, M)
+        x = x.transpose(1, 2)                # (B, M, d_latent)
+
+        # ── 自注意力 ──
+        q = self.sa_q(x); k = self.sa_k(x); v = self.sa_v(x)
+        attn = (q @ k.transpose(-2, -1)) / (self.d_latent ** 0.5)
+        attn = F.softmax(attn, dim=-1)
+        sa_out = attn @ v
+        x = self.sa_norm(sa_out + x)         # (B, M, d_latent)
+
+        # ── Expand ──
+        x = x.transpose(1, 2)                # (B, d_latent, M)
+        x = self.expand(x)                   # (B, d_pointnet, M)
+
+        # ── K, V ──
+        kv = self.kv_proj(x)                 # (B, d_kv*2, M)
+        k_pn = kv[:, :self.d_kv, :]           # (B, d_kv, M)
+        v_pn = kv[:, self.d_kv:, :]
+
+        # ── Q from V3 ──
+        q_v3 = self.q_proj(v3_view_features)  # (B, 3, d_kv)
+
+        # ── 交叉注意力 ──
+        scores = torch.bmm(q_v3, k_pn) / (self.d_kv ** 0.5)
+        attn_w = F.softmax(scores, dim=-1)
+        weighted_v = torch.bmm(attn_w, v_pn.transpose(1, 2))
+        pooled = weighted_v.mean(dim=1)        # (B, d_kv)
+
+        return self.out_proj(pooled)
+
+
+class FusionGate(nn.Module):
+    """
+    可学习的门控融合：混合逐类乘积和加法。
+
+    score = w * (σ(f1) ⊙ σ(f2)) + (1-w) * (f1 + f2)
+
+    直觉：
+      - σ(f1)⊙σ(f2): 两路必须同时认为某类高概率 → 乘法门控
+      - f1+f2:        标准 logit 相加 → 容错
+      - w:            可学习的平衡权重
+
+    支持纯乘法模式（--pure_mul），去掉 w 门控：
+      score = σ(f1) ⊙ σ(f2)
+    """
+
+    def __init__(self, pure_mul: bool = False):
+        super().__init__()
+        self.pure_mul = pure_mul
+        if not pure_mul:
+            self.w_raw = nn.Parameter(torch.tensor(0.0))  # sigmoid(0)=0.5
+        self.log_temp = nn.Parameter(torch.tensor(0.0))    # exp(0)=1.0
+
+    def forward(self, f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            f1: V3 路径 logits (B, C)
+            f2: PointNet 路径 logits (B, C)
+        Returns:
+            score: (B, C) 融合后的 logits
+        """
+        multiplicative = torch.sigmoid(f1) * torch.sigmoid(f2)
+
+        if self.pure_mul:
+            score = multiplicative
+        else:
+            w = torch.sigmoid(self.w_raw)
+            score = w * multiplicative + (1 - w) * (f1 + f2)
+
+        temperature = torch.exp(self.log_temp)
+        return score * temperature
+
+
+class MultiViewResNetV7(nn.Module):
+    """
+    V7: 冻结骨干 + PointNet(压缩→SA→扩展) + 门控融合。
+
+    结构:
+        ┌── V3 Path (同 v6) ──────────────────→ f1
+        │   但 ResNet 前几层冻结
+        │
+        └── PointNetPathV7 ────────────────────→ f2
+            压缩 → 自注意力(in latent) → 扩展
+            → 交叉注意力 → 输出
+
+        FusionGate(f1, f2) → final logits
+
+    参数:
+        freeze_until: 冻结到第几层 ('conv1','layer1','layer2','layer3')
+        pure_mul:     纯乘法融合模式（去掉 w 门控）
+    """
+
+    def __init__(self,
+                 backbone: str = "resnet18",
+                 num_views: int = 6,
+                 symmetric_fusion: bool = True,
+                 dim_reduce: int = 256,
+                 freeze_until: str = "layer2",
+                 d_latent: int = 64,
+                 d_pointnet: int = 512,
+                 d_kv: int = 128,
+                 n_sample: int = 512,
+                 pure_mul: bool = False,
+                 confidence_bias: float = -1.0,
+                 pretrained: bool = True,
+                 dropout: float = 0.5,
+                 num_classes: int = NUM_CLASSES):
+        super().__init__()
+
+        # ════════════════════════════════════════════
+        #  V3 路径
+        # ════════════════════════════════════════════
+        C_out, _ = _BACKBONES[backbone]
+        self.backbone = _make_backbone(backbone, pretrained=pretrained)
+        self.backbone_out_channels = C_out
+        self.num_views = num_views
+        self.symmetric_fusion = symmetric_fusion
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.num_fused = 3 if symmetric_fusion else num_views
+
+        # ★ 冻结 backbone 前几层
+        _freeze_order = ["conv1", "bn1", "layer1", "layer2", "layer3", "layer4"]
+        freeze_set = set()
+        for name in _freeze_order:
+            freeze_set.add(name)
+            if name == freeze_until:
+                break
+        frozen_count = 0
+        for name, param in self.backbone.named_parameters():
+            for prefix in freeze_set:
+                if name.startswith(prefix):
+                    param.requires_grad = False
+                    frozen_count += 1
+                    break
+        print(f"[V7] 冻结 {frozen_count} 个 backbone 参数 (≤ {freeze_until})")
+
+        reduction = dim_reduce
+        self.view_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(C_out, reduction),
+                nn.BatchNorm1d(reduction),
+                nn.ReLU(inplace=True),
+            )
+            for _ in range(self.num_fused)
+        ])
+        fusion_in = self.num_fused * reduction
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_in, 512),
+            nn.BatchNorm1d(512), nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256), nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes),
+        )
+        self.confidence_proj = nn.Linear(C_out, 1)
+        nn.init.constant_(self.confidence_proj.bias, confidence_bias)
+        self.view_classifiers = nn.ModuleList([
+            nn.Linear(C_out, num_classes)
+            for _ in range(self.num_fused)
+        ])
+
+        # ════════════════════════════════════════════
+        #  PointNet 路径 (V7)
+        # ════════════════════════════════════════════
+        self.point_path = PointNetPathV7(
+            in_dim=3, d_latent=d_latent, d_pointnet=d_pointnet,
+            d_kv=d_kv, n_sample=n_sample, c_out_v3=C_out,
+            num_classes=num_classes,
+        )
+
+        # ════════════════════════════════════════════
+        #  融合门
+        # ════════════════════════════════════════════
+        self.fusion_gate = FusionGate(pure_mul=pure_mul)
+
+    def forward(self, x):
+        views, points = x
+        B, V, C_img, H, W = views.shape
+
+        # ── V3 backbone ──
+        x_flat = views.view(B * V, C_img, H, W)
+        features = self.backbone(x_flat)
+        features = self.avgpool(features)
+        features = features.view(B * V, -1)
+        features = features.view(B, V, -1)
+
+        if self.symmetric_fusion:
+            f1 = features[:, 0::2, :]
+            f2 = features[:, 1::2, :]
+            features = torch.maximum(f1, f2)
+
+        v3_view_features = features
+
+        # Path A
+        projected = [self.view_projections[i](features[:, i, :])
+                     for i in range(self.num_fused)]
+        logits_fusion = self.classifier(torch.cat(projected, dim=1))
+
+        # Path B
+        logits_views = []
+        for i in range(self.num_fused):
+            feat_i = features[:, i, :]
+            conf = torch.sigmoid(self.confidence_proj(feat_i))
+            logits_views.append(conf * self.view_classifiers[i](feat_i))
+        logits_views_sum = torch.stack(logits_views, dim=1).sum(dim=1)
+
+        f1 = logits_fusion + logits_views_sum  # V3 logits
+
+        # ── PointNet 路径 ──
+        f2 = self.point_path(points, v3_view_features)
+
+        # ── 门控融合 ──
+        return self.fusion_gate(f1, f2)

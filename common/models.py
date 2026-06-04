@@ -491,16 +491,16 @@ class PointAttentionPath(nn.Module):
                       ▼ Linear(d_kv → num_classes)
                     logits_pointnet (B, 40)
 
-    参数量 < 100K，对 12M 的 V3 backbone 几乎免费。
+    参数量 ~800K，占 V3 backbone (12M) 的 ~7%。
     """
 
     def __init__(self,
                  point_dim: int = 3,
-                 d_attn: int = 64,
-                 d_pointnet: int = 128,
-                 d_kv: int = 64,
+                 d_attn: int = 128,
+                 d_pointnet: int = 512,
+                 d_kv: int = 128,
                  c_out_v3: int = 512,
-                 num_heads: int = 4,
+                 num_heads: int = 8,
                  num_classes: int = NUM_CLASSES):
         super().__init__()
 
@@ -515,13 +515,17 @@ class PointAttentionPath(nn.Module):
         self.sa_v = nn.Linear(point_dim, d_attn)
         self.sa_norm = nn.LayerNorm(d_attn)
 
-        # ── PointNet (per-point MLP, 用 Conv1d) ──
+        # ── PointNet (per-point MLP, 用 Conv1d, 5 层) ──
         self.point_mlp = nn.Sequential(
-            nn.Conv1d(d_attn, 64, 1),
-            nn.BatchNorm1d(64), nn.ReLU(inplace=True),
-            nn.Conv1d(64, 128, 1),
+            nn.Conv1d(d_attn, 128, 1),
             nn.BatchNorm1d(128), nn.ReLU(inplace=True),
-            nn.Conv1d(128, d_pointnet, 1),
+            nn.Conv1d(128, 256, 1),
+            nn.BatchNorm1d(256), nn.ReLU(inplace=True),
+            nn.Conv1d(256, 256, 1),
+            nn.BatchNorm1d(256), nn.ReLU(inplace=True),
+            nn.Conv1d(256, 512, 1),
+            nn.BatchNorm1d(512), nn.ReLU(inplace=True),
+            nn.Conv1d(512, d_pointnet, 1),
             nn.BatchNorm1d(d_pointnet), nn.ReLU(inplace=True),
         )
 
@@ -533,9 +537,12 @@ class PointAttentionPath(nn.Module):
 
         # ── 输出投影 ──
         self.out_proj = nn.Sequential(
-            nn.Linear(d_kv, d_kv * 2),
+            nn.Linear(d_kv, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(d_kv * 2, num_classes),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_classes),
         )
 
     def forward(self, points: torch.Tensor,
@@ -637,9 +644,9 @@ class MultiViewResNetV6(nn.Module):
                  num_views: int = 6,
                  symmetric_fusion: bool = True,
                  dim_reduce: int = 256,
-                 d_attn: int = 64,
-                 d_pointnet: int = 128,
-                 d_kv: int = 64,
+                 d_attn: int = 128,
+                 d_pointnet: int = 512,
+                 d_kv: int = 128,
                  confidence_bias: float = -1.0,
                  pretrained: bool = True,
                  dropout: float = 0.5,
